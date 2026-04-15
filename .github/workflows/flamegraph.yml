@@ -1,0 +1,132 @@
+name: Auto C++ Flamegraph
+
+on:
+  push:
+    branches: [ "main", "master" ]
+
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Required to push the SVG back to the repo
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          # Install perf, cmake, and bc for percentile calculation
+          sudo apt-get install -y linux-tools-common linux-tools-generic linux-tools-$(uname -r) cmake bc
+          # Clone FlameGraph scripts
+          git clone https://github.com/brendangregg/FlameGraph
+
+      - name: Build and Locate Target
+        id: build_step
+        run: |
+          # 1. Try building as a CMake project first
+          if [ -f "CMakeLists.txt" ]; then
+            echo "Detected CMakeLists.txt. Building project..."
+            mkdir build && cd build
+            cmake -DCMAKE_CXX_FLAGS="-g -fno-omit-frame-pointer" ..
+            make
+            EXEC_NAME=$(find . -maxdepth 1 -type f -executable -not -name "CMake*" | head -n 1 | sed 's|^\./||')
+            cd ..
+            if [ -z "$EXEC_NAME" ]; then echo "Error: CMake built but no executable found."; exit 1; fi
+            TARGET="./build/$EXEC_NAME"
+            
+          # 2. Fallback to compiling single/multiple flat .cpp files
+          elif ls *.cpp 1> /dev/null 2>&1; then
+            echo "Detected standalone .cpp files. Compiling directly..."
+            g++ -O2 -g -fno-omit-frame-pointer -std=c++17 *.cpp -o standalone_app
+            TARGET="./standalone_app"
+            
+          else
+            echo "Error: No CMakeLists.txt or .cpp files found in the root directory."
+            exit 1
+          fi
+          
+          echo "TARGET=$TARGET" >> $GITHUB_ENV
+          echo "Target to profile: $TARGET"
+
+      - name: Run Profiler and Benchmarks
+        run: |
+          # Allow perf to capture kernel symbols and events
+          sudo sysctl -w kernel.perf_event_paranoid=-1
+          sudo sysctl -w kernel.kptr_restrict=0
+
+          echo "Profiling $TARGET..."
+          
+          # 1. Capture perf stat (Aggregate counters)
+          sudo perf stat -o perf_stat.txt -- ${{ env.TARGET }} /usr/include || true
+
+          # 2. Run for Flamegraph/Report (Sampling)
+          sudo perf record -F 999 -e cpu-clock -g -o perf.data -- ${{ env.TARGET }} /usr/include || true
+          
+          # 3. Benchmark for percentiles (50 runs)
+          echo "Benchmarking for percentiles (50 runs)..."
+          for i in {1..50}; do
+            (time -p ${{ env.TARGET }} /usr/include) 2>&1 | grep real | awk '{print $2}' >> run_times.txt
+          done
+          
+          # Wait for disk flush and ensure permissions
+          sleep 2
+          if [ -f "perf.data" ]; then sudo chmod 666 perf.data; fi
+
+      - name: Process Results and Update Readme
+        run: |
+          # --- 1. Process Latency Percentiles ---
+          echo "Calculating percentiles..."
+          sort -n run_times.txt > sorted_times.txt
+          COUNT=$(wc -l < sorted_times.txt)
+          P90_IDX=$(echo "($COUNT * 0.90 + 0.5) / 1" | bc)
+          P95_IDX=$(echo "($COUNT * 0.95 + 0.5) / 1" | bc)
+          P99_IDX=$(echo "($COUNT * 0.99 + 0.5) / 1" | bc)
+          
+          P90=$(sed -n "${P90_IDX}p" sorted_times.txt)
+          P95=$(sed -n "${P95_IDX}p" sorted_times.txt)
+          P99=$(sed -n "${P99_IDX}p" sorted_times.txt)
+          AVG=$(awk '{ sum += $1 } END { if (NR > 0) printf "%.3f", sum / NR }' run_times.txt)
+
+          echo "\`\`\`text" > latency_summary.md
+          echo "Average: ${AVG}s" >> latency_summary.md
+          echo "P90:     ${P90}s" >> latency_summary.md
+          echo "P95:     ${P95}s" >> latency_summary.md
+          echo "P99:     ${P99}s" >> latency_summary.md
+          echo "\`\`\`" >> latency_summary.md
+
+          # --- 2. Process Perf Stat ---
+          echo "\`\`\`text" > stat_summary.md
+          cat perf_stat.txt >> stat_summary.md
+          echo "\`\`\`" >> stat_summary.md
+
+          # --- 3. Process Flamegraph & Perf Report ---
+          sudo perf script -i perf.data | ./FlameGraph/stackcollapse-perf.pl > out.perf-folded
+          ./FlameGraph/flamegraph.pl out.perf-folded > flamegraph.svg
+          
+          echo "\`\`\`text" > report_summary.md
+          sudo perf report -i perf.data --stdio --no-children -n --percent-limit 0.1 | grep -A 15 "Overhead" | head -n 16 >> report_summary.md
+          echo "\`\`\`" >> report_summary.md
+
+          # --- 4. Update Readme.md using markers ---
+          # Clear content between markers and insert new content
+          sed -i '/<!-- START_PERF_STAT -->/,/<!-- END_PERF_STAT -->/{ /<!-- START_PERF_STAT -->/!{ /<!-- END_PERF_STAT -->/!d } }' Readme.md
+          sed -i '/<!-- START_PERF_STAT -->/r stat_summary.md' Readme.md
+          
+          sed -i '/<!-- START_PERF_LATENCY -->/,/<!-- END_PERF_LATENCY -->/{ /<!-- START_PERF_LATENCY -->/!{ /<!-- END_PERF_LATENCY -->/!d } }' Readme.md
+          sed -i '/<!-- START_PERF_LATENCY -->/r latency_summary.md' Readme.md
+          
+          sed -i '/<!-- START_PERF_SUMMARY -->/,/<!-- END_PERF_SUMMARY -->/{ /<!-- START_PERF_SUMMARY -->/!{ /<!-- END_PERF_SUMMARY -->/!d } }' Readme.md
+          sed -i '/<!-- START_PERF_SUMMARY -->/r report_summary.md' Readme.md
+
+      - name: Commit and Push Changes
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add flamegraph.svg Readme.md
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore: auto-update performance report and flamegraph [skip ci]"
+            git push
+          fi
